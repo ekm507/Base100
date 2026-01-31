@@ -16,10 +16,20 @@ import (
 )
 
 const (
-	base            = 100
-	headerDigits    = 8  // LLLLGGGG
-	headerGroups    = 4  // 8 digits / 2
-	defaultFinalMod = 1_000_000 // 6 digits (3 groups)
+	base = 100
+
+	versionCurrent = 1
+
+	// Header layout: 8 groups (16 digits)
+	headerGroups = 8
+	headerDigits = headerGroups * 2
+
+	// Fixed final checksum length: 3 groups = 6 digits
+	finalCheckGroups = 3
+
+	// For safety limits (header encodes these as 00..99, but we accept some bounds)
+	maxLenBytes = 9999
+	maxGroups   = 9999
 )
 
 // ---------------- Errors ----------------
@@ -34,42 +44,7 @@ func decodeErr(stage, msg string) error {
 	return &DecodeError{Stage: stage, Msg: msg}
 }
 
-// ---------------- Settings ----------------
-
-type Settings struct {
-	BlockDataGroups  int  // e.g. 5 or 10 (counts 2-digit groups)
-	BlockCheckGroups int  // e.g. 2 (=> 4 digits) or 1 (=> 2 digits)
-	FinalCheck       bool // add/verify final checksum
-	FinalCheckGroups int  // fixed at 3 groups (6 digits) for now
-}
-
-func (s Settings) validate() error {
-	if s.BlockDataGroups <= 0 {
-		return fmt.Errorf("block-data-groups must be > 0")
-	}
-	if s.BlockCheckGroups <= 0 {
-		return fmt.Errorf("block-check-groups must be > 0")
-	}
-	if s.BlockCheckGroups > 4 {
-		// practical limit; can increase if you want
-		return fmt.Errorf("block-check-groups too large (max 4 suggested)")
-	}
-	if s.FinalCheckGroups <= 0 {
-		return fmt.Errorf("final-check-groups must be > 0")
-	}
-	return nil
-}
-
-func modForGroups(groups int) int {
-	// groups of 2 digits => base 100 per group => 100^groups
-	m := 1
-	for i := 0; i < groups; i++ {
-		m *= 100
-	}
-	return m
-}
-
-// ---------------- Helpers: digits ----------------
+// ---------------- Digits helpers ----------------
 
 var nonDigitsRe = regexp.MustCompile(`\D+`)
 
@@ -95,10 +70,10 @@ func parseUintFixedDigits(s string) (uint64, error) {
 	return n, nil
 }
 
-func splitIntoGroups(digits string, groupSize int) []string {
+func splitIntoGroups(digits string, size int) []string {
 	var out []string
-	for i := 0; i < len(digits); i += groupSize {
-		end := i + groupSize
+	for i := 0; i < len(digits); i += size {
+		end := i + size
 		if end > len(digits) {
 			end = len(digits)
 		}
@@ -116,9 +91,109 @@ func groupsToDigits(groups []int) string {
 	return b.String()
 }
 
+// ---------------- Header ----------------
+
+type Header struct {
+	Version int
+	BD      int // block data groups
+	BC      int // block checksum groups
+	Flags   int // bit0: final checksum enabled
+	L       int // byte length
+	G       int // number of DATA base100 groups
+}
+
+func (h Header) finalEnabled() bool { return (h.Flags & 1) == 1 }
+
+func (h Header) validate() error {
+	if h.Version != versionCurrent {
+		return fmt.Errorf("unsupported version: %d", h.Version)
+	}
+	if h.BD <= 0 || h.BD > 99 {
+		return fmt.Errorf("invalid BD (block-data-groups): %d", h.BD)
+	}
+	if h.BC <= 0 || h.BC > 99 {
+		return fmt.Errorf("invalid BC (block-check-groups): %d", h.BC)
+	}
+	if h.L < 0 || h.L > maxLenBytes {
+		return fmt.Errorf("invalid L (byte length): %d", h.L)
+	}
+	if h.G < 0 || h.G > maxGroups {
+		return fmt.Errorf("invalid G (data group count): %d", h.G)
+	}
+	return nil
+}
+
+func encodeHeaderDigits(h Header) (string, error) {
+	if err := h.validate(); err != nil {
+		return "", err
+	}
+	// L and G as base100 hi/lo
+	llHi, llLo := h.L/100, h.L%100
+	ggHi, ggLo := h.G/100, h.G%100
+
+	// groups:
+	// VV BD BC FF LL ll GG gg
+	g := []int{
+		h.Version,
+		h.BD,
+		h.BC,
+		h.Flags,
+		llHi,
+		llLo,
+		ggHi,
+		ggLo,
+	}
+	return groupsToDigits(g), nil
+}
+
+func parseHeaderDigits(digitsOnly string) (Header, error) {
+	if len(digitsOnly) < headerDigits {
+		return Header{}, decodeErr("header", "code too short for header")
+	}
+	if !isAllDigits(digitsOnly[:headerDigits]) {
+		return Header{}, decodeErr("header", "header contains non-digits")
+	}
+
+	raw := digitsOnly[:headerDigits]
+	gr := splitIntoGroups(raw, 2)
+	if len(gr) != headerGroups {
+		return Header{}, decodeErr("header", "failed to split header groups")
+	}
+
+	val := make([]int, headerGroups)
+	for i := 0; i < headerGroups; i++ {
+		u, err := parseUintFixedDigits(gr[i])
+		if err != nil || u > 99 {
+			return Header{}, decodeErr("header", fmt.Sprintf("invalid header group %q at index %d", gr[i], i))
+		}
+		val[i] = int(u)
+	}
+
+	h := Header{
+		Version: val[0],
+		BD:      val[1],
+		BC:      val[2],
+		Flags:   val[3],
+		L:       val[4]*100 + val[5],
+		G:       val[6]*100 + val[7],
+	}
+	if err := h.validate(); err != nil {
+		return Header{}, decodeErr("header", err.Error())
+	}
+	return h, nil
+}
+
 // ---------------- Checksums ----------------
 
-// CRC over ASCII digits, then mod 100^k, formatted as k groups (2-digit each)
+func modForGroups(groups int) int {
+	m := 1
+	for i := 0; i < groups; i++ {
+		m *= 100
+	}
+	return m
+}
+
+// CRC32(payloadDigits) mod 100^k, formatted as 2*k digits (zero padded)
 func checksumK(payloadDigits string, kGroups int) (string, error) {
 	for _, r := range payloadDigits {
 		if r < '0' || r > '9' {
@@ -128,21 +203,25 @@ func checksumK(payloadDigits string, kGroups int) (string, error) {
 	mod := modForGroups(kGroups)
 	sum := crc32.ChecksumIEEE([]byte(payloadDigits))
 	val := int(sum % uint32(mod))
-	// format as 2*k digits (zero-padded)
 	return fmt.Sprintf("%0*d", 2*kGroups, val), nil
 }
 
-// For block checksum, we include block index in digits to reduce “block swap” errors detection when final-check is off.
-func blockChecksumDigits(header string, blockIndex int, blockDataDigits string, kGroups int) (string, error) {
-	// blockIndex: 1..N as 4 digits
-	blk := fmt.Sprintf("%04d", blockIndex)
-	payload := header + blk + blockDataDigits
-	return checksumK(payload, kGroups)
+func blockIndexDigits(blockIndex int) string {
+	// blockIndex up to 9999 -> 2 base100 groups (4 digits)
+	hi := blockIndex / 100
+	lo := blockIndex % 100
+	return fmt.Sprintf("%02d%02d", hi, lo)
 }
 
-// final checksum covers everything except itself (header + all blocks including their checksums)
-func finalChecksumDigits(allExceptFinal string, kGroups int) (string, error) {
-	return checksumK(allExceptFinal, kGroups)
+// Block checksum covers: header + blockIndex(2 groups) + blockDataDigits
+func blockChecksumDigits(headerDigits string, blockIndex int, blockDataDigits string, bcGroups int) (string, error) {
+	payload := headerDigits + blockIndexDigits(blockIndex) + blockDataDigits
+	return checksumK(payload, bcGroups)
+}
+
+// Final checksum covers: header + all blocks (data+blockchk), excluding itself
+func finalChecksumDigits(allExceptFinal string) (string, error) {
+	return checksumK(allExceptFinal, finalCheckGroups)
 }
 
 // ---------------- Base100 conversion ----------------
@@ -195,68 +274,79 @@ func toFixedLengthBytes(x *big.Int, length int) ([]byte, error) {
 	return out, nil
 }
 
-// ---------------- Encoding format ----------------
-//
-// DIGITS-ONLY FORMAT:
-//
-//   HEADER: 8 digits => LLLLGGGG
-//     LLLL = byte length (0000..9999)
-//     GGGG = count of DATA groups (0000..9999)
-//
-//   Then blocks:
-//     [DATA(block)] [BCHK(block)]
-//     where DATA(block) = up to BlockDataGroups groups (2 digits each)
-//           BCHK(block) = BlockCheckGroups groups (2 digits each)
-//
-//   Optional final checksum at end:
-//     FINAL = FinalCheckGroups groups (default 3 groups => 6 digits)
-//     computed over: HEADER + all block segments (DATA+blockCHK) concatenated
-//
+// ---------------- Encoding ----------------
 
-func encodeText(text string, s Settings) (string, error) {
-	if err := s.validate(); err != nil {
-		return "", err
+type EncodeSettings struct {
+	BD    int
+	BC    int
+	Final bool
+}
+
+func encodeText(text string, es EncodeSettings) (string, error) {
+	if es.BD <= 0 || es.BD > 99 {
+		return "", fmt.Errorf("block-data-groups must be 1..99")
+	}
+	if es.BC <= 0 || es.BC > 99 {
+		return "", fmt.Errorf("block-check-groups must be 1..99")
 	}
 
 	b := []byte(text)
 	L := len(b)
-	if L > 9999 {
-		return "", fmt.Errorf("input too long in bytes (%d), max 9999", L)
+	if L > maxLenBytes {
+		return "", fmt.Errorf("input too long in bytes (%d), max %d", L, maxLenBytes)
 	}
 
 	x := new(big.Int).SetBytes(b)
 	dataGroups := toBase100Digits(x)
 	G := len(dataGroups)
-	if G > 9999 {
-		return "", fmt.Errorf("too many DATA groups (%d), max 9999", G)
+	if G > maxGroups {
+		return "", fmt.Errorf("too many DATA groups (%d), max %d", G, maxGroups)
 	}
 
-	header := fmt.Sprintf("%04d%04d", L, G)
+	flags := 0
+	if es.Final {
+		flags |= 1
+	}
 
-	// build blocks
+	h := Header{
+		Version: versionCurrent,
+		BD:      es.BD,
+		BC:      es.BC,
+		Flags:   flags,
+		L:       L,
+		G:       G,
+	}
+
+	headerDigits, err := encodeHeaderDigits(h)
+	if err != nil {
+		return "", err
+	}
+
 	var out strings.Builder
-	out.WriteString(header)
+	out.WriteString(headerDigits)
 
+	// blocks
 	blockCount := 0
-	for i := 0; i < G; i += s.BlockDataGroups {
+	for i := 0; i < G; i += es.BD {
 		blockCount++
-		end := i + s.BlockDataGroups
+		end := i + es.BD
 		if end > G {
 			end = G
 		}
-		blockData := dataGroups[i:end]
-		blockDataDigits := groupsToDigits(blockData)
+		blockDataDigits := groupsToDigits(dataGroups[i:end])
 
-		bchk, err := blockChecksumDigits(header, blockCount, blockDataDigits, s.BlockCheckGroups)
+		bchk, err := blockChecksumDigits(headerDigits, blockCount, blockDataDigits, es.BC)
 		if err != nil {
 			return "", err
 		}
+
 		out.WriteString(blockDataDigits)
 		out.WriteString(bchk)
 	}
 
-	if s.FinalCheck {
-		fc, err := finalChecksumDigits(out.String(), s.FinalCheckGroups)
+	// final checksum
+	if es.Final {
+		fc, err := finalChecksumDigits(out.String())
 		if err != nil {
 			return "", err
 		}
@@ -266,163 +356,129 @@ func encodeText(text string, s Settings) (string, error) {
 	return out.String(), nil
 }
 
-// ---------------- Decoding & validation ----------------
+// ---------------- Decoding & Report ----------------
 
 type BlockStatus struct {
 	BlockIndex int
-	Ok         bool
 	Expected   string
 	Got        string
 }
 
 type DecodeReport struct {
-	HeaderOK          bool
-	FinalOK           bool
-	BadBlocks         []BlockStatus
-	TotalBlocks       int
-	TotalDataGroups   int
-	FinalExpected     string
-	FinalGot          string
-	NormalizedDigits  string
+	Header       Header
+	BadBlocks    []BlockStatus
+	FinalOK      bool
+	FinalExpected string
+	FinalGot      string
 }
 
-func decodeCodeWithReport(code string, s Settings, verify bool) (string, DecodeReport, error) {
+func decodeCodeWithReport(code string, verify bool) (string, DecodeReport, error) {
 	var rep DecodeReport
-	if err := s.validate(); err != nil {
-		return "", rep, err
-	}
 
 	d := stripNonDigits(code)
-	rep.NormalizedDigits = d
-
 	if len(d) < headerDigits {
-		return "", rep, decodeErr("format", "code too short for header")
+		return "", rep, decodeErr("format", "code too short")
 	}
 	if !isAllDigits(d) {
-		return "", rep, decodeErr("format", "code contains non-digits after normalization (unexpected)")
+		return "", rep, decodeErr("format", "code has non-digits after normalization (unexpected)")
 	}
 
-	header := d[:headerDigits]
-	Lraw := header[:4]
-	Graw := header[4:8]
-
-	Lu, err := parseUintFixedDigits(Lraw)
+	h, err := parseHeaderDigits(d)
 	if err != nil {
-		return "", rep, decodeErr("header", "invalid LLLL in header")
+		return "", rep, err
 	}
-	Gu, err := parseUintFixedDigits(Graw)
-	if err != nil {
-		return "", rep, decodeErr("header", "invalid GGGG in header")
-	}
-	L := int(Lu)
-	G := int(Gu)
-	rep.HeaderOK = true
-	rep.TotalDataGroups = G
+	rep.Header = h
 
-	// Determine if final checksum exists
+	headerDigitsStr := d[:headerDigits]
+	body := d[headerDigits:]
+
 	finalDigits := 0
-	if s.FinalCheck {
-		finalDigits = 2 * s.FinalCheckGroups
-		if len(d) < headerDigits+finalDigits {
+	if h.finalEnabled() {
+		finalDigits = finalCheckGroups * 2
+		if len(body) < finalDigits {
 			return "", rep, decodeErr("format", "code too short for final checksum")
 		}
+		rep.FinalGot = body[len(body)-finalDigits:]
+		body = body[:len(body)-finalDigits]
+	} else {
+		rep.FinalOK = true
 	}
 
-	body := d[headerDigits:]
-	finalGot := ""
-	bodyWithoutFinal := body
-	if s.FinalCheck {
-		finalGot = body[len(body)-finalDigits:]
-		bodyWithoutFinal = body[:len(body)-finalDigits]
-		rep.FinalGot = finalGot
-	}
-
-	// Parse blocks using G and per-block sizes
-	perBlockCheckDigits := 2 * s.BlockCheckGroups
-
-	// We know how many blocks:
-	totalBlocks := (G + s.BlockDataGroups - 1) / s.BlockDataGroups
-	rep.TotalBlocks = totalBlocks
-
-	// Walk blocks, reconstruct data groups, and validate block checksums
-	dataGroups := make([]int, 0, G)
+	// Parse blocks
+	totalBlocks := (h.G + h.BD - 1) / h.BD
+	perBlockCheckDigits := h.BC * 2
 
 	cursor := 0
+	dataGroups := make([]int, 0, h.G)
+
 	for blk := 1; blk <= totalBlocks; blk++ {
-		remainingData := G - len(dataGroups)
-		thisDataGroups := s.BlockDataGroups
-		if remainingData < thisDataGroups {
-			thisDataGroups = remainingData
+		remaining := h.G - (blk-1)*h.BD
+		thisDataGroups := h.BD
+		if remaining < thisDataGroups {
+			thisDataGroups = remaining
 		}
 		thisDataDigits := thisDataGroups * 2
 
 		need := thisDataDigits + perBlockCheckDigits
-		if cursor+need > len(bodyWithoutFinal) {
-			return "", rep, decodeErr("format", fmt.Sprintf("truncated at block %d (need %d digits, have %d)", blk, need, len(bodyWithoutFinal)-cursor))
+		if cursor+need > len(body) {
+			return "", rep, decodeErr("format", fmt.Sprintf("truncated at block %d", blk))
 		}
 
-		blockDataDigits := bodyWithoutFinal[cursor : cursor+thisDataDigits]
-		blockChkGot := bodyWithoutFinal[cursor+thisDataDigits : cursor+need]
+		blockDataDigits := body[cursor : cursor+thisDataDigits]
+		blockChkGot := body[cursor+thisDataDigits : cursor+need]
 		cursor += need
 
-		// validate block checksum
-		exp, err := blockChecksumDigits(header, blk, blockDataDigits, s.BlockCheckGroups)
+		exp, err := blockChecksumDigits(headerDigitsStr, blk, blockDataDigits, h.BC)
 		if err != nil {
 			return "", rep, decodeErr("checksum", "failed to compute block checksum")
 		}
-		ok := (blockChkGot == exp)
-		if verify && !ok {
+		if verify && blockChkGot != exp {
 			rep.BadBlocks = append(rep.BadBlocks, BlockStatus{
 				BlockIndex: blk,
-				Ok:         false,
 				Expected:   exp,
 				Got:        blockChkGot,
 			})
 		}
 
-		// parse block data digits into groups
+		// parse block data groups
 		for i := 0; i < len(blockDataDigits); i += 2 {
 			pair := blockDataDigits[i : i+2]
-			v, err := parseUintFixedDigits(pair)
-			if err != nil || v > 99 {
-				return "", rep, decodeErr("data", fmt.Sprintf("invalid base-100 group %q in block %d", pair, blk))
+			u, err := parseUintFixedDigits(pair)
+			if err != nil || u > 99 {
+				return "", rep, decodeErr("data", fmt.Sprintf("invalid group %q in block %d", pair, blk))
 			}
-			dataGroups = append(dataGroups, int(v))
+			dataGroups = append(dataGroups, int(u))
 		}
 	}
 
-	// extra garbage?
-	if cursor != len(bodyWithoutFinal) {
-		return "", rep, decodeErr("format", "extra trailing digits in body (settings mismatch?)")
+	if cursor != len(body) {
+		return "", rep, decodeErr("format", "extra trailing digits in body (header/settings mismatch?)")
 	}
 
-	// verify final checksum
-	if verify && s.FinalCheck {
-		fullExceptFinal := header + bodyWithoutFinal
-		exp, err := finalChecksumDigits(fullExceptFinal, s.FinalCheckGroups)
+	// final checksum verify
+	if verify && h.finalEnabled() {
+		fullExceptFinal := headerDigitsStr + body
+		exp, err := finalChecksumDigits(fullExceptFinal)
 		if err != nil {
 			return "", rep, decodeErr("checksum", "failed to compute final checksum")
 		}
 		rep.FinalExpected = exp
-		rep.FinalOK = (finalGot == exp)
+		rep.FinalOK = (rep.FinalGot == exp)
 		if !rep.FinalOK {
-			// keep going; we’ll still try to decode (maybe only final part mistyped)
+			// keep going; caller decides (repair)
 		}
-	} else {
-		rep.FinalOK = true
 	}
 
-	// If verify and there are bad blocks, stop with checksum error (caller may repair)
 	if verify && len(rep.BadBlocks) > 0 {
 		return "", rep, decodeErr("checksum", fmt.Sprintf("%d block checksum mismatches", len(rep.BadBlocks)))
 	}
-	if verify && s.FinalCheck && !rep.FinalOK {
+	if verify && h.finalEnabled() && !rep.FinalOK {
 		return "", rep, decodeErr("checksum", "final checksum mismatch")
 	}
 
-	// decode data groups to bytes
+	// decode base100 -> bytes(L)
 	x := fromBase100Digits(dataGroups)
-	outBytes, err := toFixedLengthBytes(x, L)
+	outBytes, err := toFixedLengthBytes(x, h.L)
 	if err != nil {
 		return "", rep, decodeErr("bytes", err.Error())
 	}
@@ -434,14 +490,18 @@ func decodeCodeWithReport(code string, s Settings, verify bool) (string, DecodeR
 
 // ---------------- Pretty printing ----------------
 
-func prettyPrint(out io.Writer, digitsOnly string, s Settings, highlight map[int]map[int]bool) {
-	// highlight[blockIndex][posInBlockSegment] == true
-	// posInBlockSegment counts groups in the *printed segment* of that block:
-	//   1..BlockDataGroups for data, then (BlockDataGroups+1..BlockDataGroups+BlockCheckGroups) for block checksum
-	// (last block may have fewer data groups; we still number within its real size)
+func prettyPrint(out io.Writer, digitsOnly string, highlight map[int]map[int]bool) {
+	// highlight[block][pos] => true
+	// block: 1..N ; block 0 used for FINAL (pos 1..finalCheckGroups)
 
 	d := stripNonDigits(digitsOnly)
 	if len(d) < headerDigits {
+		fmt.Fprintln(out, d)
+		return
+	}
+
+	h, err := parseHeaderDigits(d)
+	if err != nil {
 		fmt.Fprintln(out, d)
 		return
 	}
@@ -454,51 +514,44 @@ func prettyPrint(out io.Writer, digitsOnly string, s Settings, highlight map[int
 	green := "\x1b[32m"
 	red := "\x1b[31m"
 
-	header := d[:headerDigits]
-	L := header[:4]
-	G := header[4:8]
+	headerDigitsStr := d[:headerDigits]
+	headerGroupsStr := splitIntoGroups(headerDigitsStr, 2)
 
-	fmt.Fprintf(out, "%sHEADER%s  LEN=%s%s%s  GROUPS=%s%s%s\n\n",
-		bold, reset, cyan, L, reset, cyan, G, reset)
+	fmt.Fprintf(out, "%sHEADER%s  %s\n", bold, reset, strings.Join(headerGroupsStr, " "))
+	fmt.Fprintf(out, "%sparams%s  ver=%d  BD=%d  BC=%d  final=%v  L=%d  G=%d\n\n",
+		bold, reset, h.Version, h.BD, h.BC, h.finalEnabled(), h.L, h.G)
 
-	// parse header to know blocks
-	Gu, _ := parseUintFixedDigits(G)
-	totalGroups := int(Gu)
-	totalBlocks := (totalGroups + s.BlockDataGroups - 1) / s.BlockDataGroups
-
-	// remove final checksum for printing separately
 	body := d[headerDigits:]
-	finalDigits := 0
+
+	// strip final (print it separately)
 	finalPart := ""
-	bodyWithoutFinal := body
-	if s.FinalCheck {
-		finalDigits = 2 * s.FinalCheckGroups
-		if len(body) >= finalDigits {
-			finalPart = body[len(body)-finalDigits:]
-			bodyWithoutFinal = body[:len(body)-finalDigits]
+	if h.finalEnabled() {
+		fd := finalCheckGroups * 2
+		if len(body) >= fd {
+			finalPart = body[len(body)-fd:]
+			body = body[:len(body)-fd]
 		}
 	}
 
-	cursor := 0
-	perBlockCheckDigits := 2 * s.BlockCheckGroups
+	totalBlocks := (h.G + h.BD - 1) / h.BD
+	perBlockCheckDigits := h.BC * 2
 
+	cursor := 0
 	for blk := 1; blk <= totalBlocks; blk++ {
-		remaining := totalGroups - (blk-1)*s.BlockDataGroups
-		thisDataGroups := s.BlockDataGroups
+		remaining := h.G - (blk-1)*h.BD
+		thisDataGroups := h.BD
 		if remaining < thisDataGroups {
 			thisDataGroups = remaining
 		}
 		thisDataDigits := thisDataGroups * 2
 
-		blockData := bodyWithoutFinal[cursor : cursor+thisDataDigits]
-		blockChk := bodyWithoutFinal[cursor+thisDataDigits : cursor+thisDataDigits+perBlockCheckDigits]
+		blockData := body[cursor : cursor+thisDataDigits]
+		blockChk := body[cursor+thisDataDigits : cursor+thisDataDigits+perBlockCheckDigits]
 		cursor += thisDataDigits + perBlockCheckDigits
 
-		// groups for printing
 		dataGroups := splitIntoGroups(blockData, 2)
 		chkGroups := splitIntoGroups(blockChk, 2)
 
-		// build line: [NN] data... | chk...
 		var parts []string
 		for i, g := range dataGroups {
 			color := yellow
@@ -520,9 +573,16 @@ func prettyPrint(out io.Writer, digitsOnly string, s Settings, highlight map[int
 		fmt.Fprintf(out, "%s%02d%s: %s\n", bold, blk, reset, strings.Join(parts, " "))
 	}
 
-	if s.FinalCheck && finalPart != "" {
-		finalGroups := splitIntoGroups(finalPart, 2)
-		fmt.Fprintf(out, "\n%sFINAL%s: %s\n", bold, reset, strings.Join(finalGroups, " "))
+	if h.finalEnabled() && finalPart != "" {
+		fg := splitIntoGroups(finalPart, 2)
+		for i := range fg {
+			if highlight != nil && highlight[0] != nil && highlight[0][i+1] {
+				fg[i] = red + fg[i] + reset
+			} else {
+				fg[i] = cyan + fg[i] + reset
+			}
+		}
+		fmt.Fprintf(out, "\n%sFINAL%s: %s\n", bold, reset, strings.Join(fg, " "))
 	}
 
 	fmt.Fprintf(out, "\n%sFULL%s %s\n", bold, reset, d)
@@ -531,9 +591,10 @@ func prettyPrint(out io.Writer, digitsOnly string, s Settings, highlight map[int
 // ---------------- Repair ----------------
 
 type Edit struct {
-	Block     int // 1-based
-	Pos       int // group position within printed block segment (data then chk)
-	From, To  int
+	Block int // 1..N, 0 = FINAL
+	Pos   int // position inside that segment (data then chk for blocks; 1..finalCheckGroups for FINAL)
+	From  int
+	To    int
 }
 
 type RepairResult struct {
@@ -542,103 +603,89 @@ type RepairResult struct {
 	Edits       []Edit
 }
 
-func tryRepair(digitsOnly string, s Settings, maxEdits int, maxCandidates int) ([]RepairResult, error) {
+func tryRepair(code string, maxEdits int, maxCandidates int) ([]RepairResult, error) {
 	if maxEdits <= 0 {
 		return nil, nil
 	}
 	if maxCandidates <= 0 {
 		maxCandidates = 1
 	}
-	if err := s.validate(); err != nil {
-		return nil, err
-	}
 
-	// First, decode with report to find bad blocks / whether final mismatch
-	_, rep, err := decodeCodeWithReport(digitsOnly, s, true)
-	if err == nil {
-		return nil, nil // nothing to repair
-	}
-
-	// If no bad blocks but final mismatch only: we can attempt to repair FINAL digits by brute-forcing FINAL groups.
-	// We’ll do that after block repair attempt.
-	badBlocks := make([]int, 0, len(rep.BadBlocks))
-	for _, b := range rep.BadBlocks {
-		badBlocks = append(badBlocks, b.BlockIndex)
-	}
-	sort.Ints(badBlocks)
-
-	normalized := stripNonDigits(digitsOnly)
-	if len(normalized) < headerDigits {
+	d := stripNonDigits(code)
+	if len(d) < headerDigits {
 		return nil, decodeErr("repair", "code too short")
 	}
 
-	// Build a mutable slice of 2-digit groups for the whole message
-	if len(normalized)%2 != 0 {
+	// First get report (verify=true) to know bad blocks / final mismatch
+	_, rep, derr := decodeCodeWithReport(d, true)
+	if derr == nil {
+		return nil, nil
+	}
+	h := rep.Header
+	headerDigitsStr := d[:headerDigits]
+
+	// Build groups array for whole code (2-digit groups)
+	if len(d)%2 != 0 {
 		return nil, decodeErr("repair", "digits length not even")
 	}
-	allGroupsStr := splitIntoGroups(normalized, 2)
+	allGroupsStr := splitIntoGroups(d, 2)
 	allGroups := make([]int, len(allGroupsStr))
 	for i, g := range allGroupsStr {
-		v, e := parseUintFixedDigits(g)
-		if e != nil || v > 99 {
+		u, err := parseUintFixedDigits(g)
+		if err != nil || u > 99 {
 			return nil, decodeErr("repair", fmt.Sprintf("invalid group %q at index %d", g, i))
 		}
-		allGroups[i] = int(v)
+		allGroups[i] = int(u)
 	}
 
-	// Locate group ranges for each block segment (data+blockchk) in terms of absolute group indices.
-	// Layout in groups:
-	//   headerGroups (4) +
-	//   blocks: for each block: dataGroups + checkGroups
-	//   optional final: FinalCheckGroups
-	// We know total data groups from header (GGGG)
-	Graw := normalized[4:8]
-	Gu, _ := parseUintFixedDigits(Graw)
-	totalDataGroups := int(Gu)
-	totalBlocks := (totalDataGroups + s.BlockDataGroups - 1) / s.BlockDataGroups
+	// Compute absolute group ranges
+	// layout in groups:
+	// headerGroups +
+	// blocks (each: dataCount + BC) +
+	// optional final (finalCheckGroups)
+	totalBlocks := (h.G + h.BD - 1) / h.BD
 
 	type blockRange struct {
-		blk          int
-		startAbs     int // inclusive, in group indices
-		dataCount    int
-		checkCount   int
-		endAbs       int // exclusive
+		blk        int
+		startAbs   int // inclusive
+		dataCount  int
+		checkCount int
+		endAbs     int // exclusive
 	}
-	ranges := []blockRange{}
+	var ranges []blockRange
 	cursor := headerGroups
 	for blk := 1; blk <= totalBlocks; blk++ {
-		remaining := totalDataGroups - (blk-1)*s.BlockDataGroups
-		dataCount := s.BlockDataGroups
+		remaining := h.G - (blk-1)*h.BD
+		dataCount := h.BD
 		if remaining < dataCount {
 			dataCount = remaining
 		}
 		start := cursor
-		end := cursor + dataCount + s.BlockCheckGroups
+		end := cursor + dataCount + h.BC
 		ranges = append(ranges, blockRange{
 			blk:        blk,
 			startAbs:   start,
 			dataCount:  dataCount,
-			checkCount: s.BlockCheckGroups,
+			checkCount: h.BC,
 			endAbs:     end,
 		})
 		cursor = end
 	}
-
-	// final range (absolute groups)
 	finalStart := cursor
 	finalEnd := cursor
-	if s.FinalCheck {
-		finalEnd = finalStart + s.FinalCheckGroups
+	if h.finalEnabled() {
+		finalEnd = finalStart + finalCheckGroups
 		if finalEnd > len(allGroups) {
 			return nil, decodeErr("repair", "missing final checksum groups")
 		}
 	}
 
-	// Target positions for edits:
-	// - If we have bad blocks: search inside those blocks (both data and block checksum groups).
-	// - Else (final mismatch only): search only inside FINAL groups.
-	targetAbsPositions := []int{}
-	targetMeta := map[int]Edit{} // template filled later
+	// Determine targets:
+	badBlocks := make([]int, 0, len(rep.BadBlocks))
+	for _, b := range rep.BadBlocks {
+		badBlocks = append(badBlocks, b.BlockIndex)
+	}
+	sort.Ints(badBlocks)
 
 	inSet := func(x int, set []int) bool {
 		for _, v := range set {
@@ -649,28 +696,10 @@ func tryRepair(digitsOnly string, s Settings, maxEdits int, maxCandidates int) (
 		return false
 	}
 
-	if len(badBlocks) > 0 {
-		for _, br := range ranges {
-			if !inSet(br.blk, badBlocks) {
-				continue
-			}
-			for abs := br.startAbs; abs < br.endAbs; abs++ {
-				targetAbsPositions = append(targetAbsPositions, abs)
-			}
-		}
-	} else if s.FinalCheck && !rep.FinalOK {
-		for abs := finalStart; abs < finalEnd; abs++ {
-			targetAbsPositions = append(targetAbsPositions, abs)
-		}
-	} else {
-		// unknown mismatch type; nothing sensible
-		return nil, decodeErr("repair", "no identifiable bad blocks or final mismatch in report")
-	}
-
-	// Map abs group index -> (block, posInBlockSegment) for reporting/highlighting
+	targetAbs := []int{}
+	targetMeta := map[int]Edit{} // abs->(block,pos)
 	absToLoc := func(abs int) (blk int, pos int, ok bool) {
-		// final checksum "block" reported as 0
-		if s.FinalCheck && abs >= finalStart && abs < finalEnd {
+		if h.finalEnabled() && abs >= finalStart && abs < finalEnd {
 			return 0, abs - finalStart + 1, true
 		}
 		for _, br := range ranges {
@@ -681,18 +710,30 @@ func tryRepair(digitsOnly string, s Settings, maxEdits int, maxCandidates int) (
 		return 0, 0, false
 	}
 
-	for _, abs := range targetAbsPositions {
-		blk, pos, ok := absToLoc(abs)
-		if !ok {
-			continue
+	if len(badBlocks) > 0 {
+		for _, br := range ranges {
+			if !inSet(br.blk, badBlocks) {
+				continue
+			}
+			for abs := br.startAbs; abs < br.endAbs; abs++ {
+				targetAbs = append(targetAbs, abs)
+				blk, pos, _ := absToLoc(abs)
+				targetMeta[abs] = Edit{Block: blk, Pos: pos}
+			}
 		}
-		targetMeta[abs] = Edit{Block: blk, Pos: pos}
+	} else if h.finalEnabled() && !rep.FinalOK {
+		for abs := finalStart; abs < finalEnd; abs++ {
+			targetAbs = append(targetAbs, abs)
+			blk, pos, _ := absToLoc(abs)
+			targetMeta[abs] = Edit{Block: blk, Pos: pos}
+		}
+	} else {
+		return nil, decodeErr("repair", "no identifiable bad blocks or final mismatch")
 	}
 
 	results := make([]RepairResult, 0, maxCandidates)
 
-	// DFS edits (1..maxEdits) over targetAbsPositions
-	// DFS edits (1..maxEdits) over targetAbsPositions
+	// DFS edits
 	var dfs func(startIdx int, editsLeft int, chosenAbs []int, fromVals []int, toVals []int)
 
 	testCandidate := func(chosenAbs []int, fromVals []int, toVals []int) {
@@ -704,12 +745,15 @@ func tryRepair(digitsOnly string, s Settings, maxEdits int, maxCandidates int) (
 		}
 		candDigits := b.String()
 
-		// Verify fully
-		text, _, derr := decodeCodeWithReport(candDigits, s, true)
-		if derr != nil {
+		// Verify full decode using embedded settings
+		text, _, err := decodeCodeWithReport(candDigits, true)
+		if err != nil {
 			return
 		}
-		reenc, eerr := encodeText(text, s)
+
+		// Re-encode with the SAME embedded settings (from header)
+		es := EncodeSettings{BD: h.BD, BC: h.BC, Final: h.finalEnabled()}
+		reenc, eerr := encodeText(text, es)
 		if eerr != nil {
 			return
 		}
@@ -740,7 +784,6 @@ func tryRepair(digitsOnly string, s Settings, maxEdits int, maxCandidates int) (
 			return
 		}
 
-		// test at any depth >=1 edit
 		if len(chosenAbs) > 0 {
 			testCandidate(chosenAbs, fromVals, toVals)
 			if len(results) >= maxCandidates {
@@ -752,24 +795,20 @@ func tryRepair(digitsOnly string, s Settings, maxEdits int, maxCandidates int) (
 			return
 		}
 
-		for i := startIdx; i < len(targetAbsPositions); i++ {
-			abs := targetAbsPositions[i]
+		for i := startIdx; i < len(targetAbs); i++ {
+			abs := targetAbs[i]
 			orig := allGroups[abs]
-
 			for nv := 0; nv < 100; nv++ {
 				if nv == orig {
 					continue
 				}
 				allGroups[abs] = nv
-
 				dfs(i+1, editsLeft-1,
 					append(chosenAbs, abs),
 					append(fromVals, orig),
 					append(toVals, nv),
 				)
-
 				allGroups[abs] = orig
-
 				if len(results) >= maxCandidates {
 					return
 				}
@@ -781,7 +820,31 @@ func tryRepair(digitsOnly string, s Settings, maxEdits int, maxCandidates int) (
 		dfs(0, e, nil, nil, nil)
 	}
 
+	// If nothing found and the only mismatch was FINAL, print a hintable error:
+	_ = headerDigitsStr // keep for future extensions
 	return results, nil
+}
+
+func editsToHighlight(edits []Edit) map[int]map[int]bool {
+	hl := map[int]map[int]bool{}
+	for _, e := range edits {
+		if hl[e.Block] == nil {
+			hl[e.Block] = map[int]bool{}
+		}
+		hl[e.Block][e.Pos] = true
+	}
+	return hl
+}
+
+func printEdits(out io.Writer, edits []Edit) {
+	fmt.Fprintln(out, "\x1b[1mEDITS\x1b[0m")
+	for _, e := range edits {
+		if e.Block == 0 {
+			fmt.Fprintf(out, " - FINAL pos=%d  %02d -> %02d\n", e.Pos, e.From, e.To)
+		} else {
+			fmt.Fprintf(out, " - block=%d pos=%d  %02d -> %02d\n", e.Block, e.Pos, e.From, e.To)
+		}
+	}
 }
 
 // ---------------- CLI IO ----------------
@@ -807,24 +870,16 @@ func readAllStdin() (string, error) {
 func usage() {
 	fmt.Fprintf(os.Stderr, `Usage:
   urlcode encode [--text "..."] [--pretty]
-               [--block-data-groups N] [--block-check-groups K]
+               --block-data-groups N --block-check-groups K
                [--final-check | --no-final-check]
 
   urlcode decode [--code "..."] [--pretty] [--no-check]
-               [--block-data-groups N] [--block-check-groups K]
-               [--final-check | --no-final-check]
                [--repair E] [--max-candidates C]
 
 Notes:
-- Groups are 2-digit numbers (00..99).
-- Each printed block shows: DATA groups then '|' then block checksum groups.
-- Header is always: LLLLGGGG (byte length + number of DATA groups).
-
-Examples:
-  urlcode encode --text "https://example.com/..." --pretty --block-data-groups 5 --block-check-groups 2 --final-check
-  urlcode decode --code "...." --pretty --block-data-groups 10 --block-check-groups 1 --no-final-check
-  urlcode decode --code "...." --repair 1 --max-candidates 3 --pretty
-
+- Decode reads BD/BC/final from the HEADER; you do NOT pass them on decode.
+- Header is 8 groups (16 digits): VV BD BC FF LL ll GG gg
+- FINAL checksum (if enabled) is always 3 groups (6 digits).
 `)
 }
 
@@ -844,29 +899,6 @@ func main() {
 	}
 }
 
-func commonFlags(fs *flag.FlagSet) (*int, *int, *bool, *bool) {
-	blockData := fs.Int("block-data-groups", 5, "How many 2-digit groups of DATA per block (e.g. 5 or 10)")
-	blockChk := fs.Int("block-check-groups", 2, "How many 2-digit groups of checksum per block (e.g. 2 or 1)")
-
-	finalOn := fs.Bool("final-check", true, "Enable final checksum")
-	finalOff := fs.Bool("no-final-check", false, "Disable final checksum (overrides --final-check)")
-
-	return blockData, blockChk, finalOn, finalOff
-}
-
-func buildSettings(blockData, blockChk int, finalOn, finalOff bool) Settings {
-	final := finalOn
-	if finalOff {
-		final = false
-	}
-	return Settings{
-		BlockDataGroups:  blockData,
-		BlockCheckGroups: blockChk,
-		FinalCheck:       final,
-		FinalCheckGroups: 3, // 6 digits
-	}
-}
-
 func runEncode(args []string) {
 	fs := flag.NewFlagSet("encode", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -874,7 +906,11 @@ func runEncode(args []string) {
 	text := fs.String("text", "", "Text/URL to encode (or read from stdin)")
 	prettyFlag := fs.Bool("pretty", false, "Pretty block-numbered output")
 
-	blockData, blockChk, finalOn, finalOff := commonFlags(fs)
+	bd := fs.Int("block-data-groups", 5, "How many 2-digit DATA groups per block (1..99)")
+	bc := fs.Int("block-check-groups", 2, "How many 2-digit checksum groups per block (1..99)")
+
+	finalOn := fs.Bool("final-check", true, "Enable final checksum")
+	finalOff := fs.Bool("no-final-check", false, "Disable final checksum (overrides --final-check)")
 
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -895,23 +931,22 @@ func runEncode(args []string) {
 		os.Exit(2)
 	}
 
-	s := buildSettings(*blockData, *blockChk, *finalOn, *finalOff)
-	if err := s.validate(); err != nil {
-		fmt.Fprintln(os.Stderr, "settings error:", err)
-		os.Exit(2)
+	final := *finalOn
+	if *finalOff {
+		final = false
 	}
 
-	code, err := encodeText(in, s)
+	code, err := encodeText(in, EncodeSettings{BD: *bd, BC: *bc, Final: final})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "encode error:", err)
 		os.Exit(1)
 	}
 
 	if *prettyFlag {
-		prettyPrint(os.Stdout, code, s, nil)
+		prettyPrint(os.Stdout, code, nil)
 	} else {
-		// simple: space each 2-digit group, dash between printed blocks
-		fmt.Println(formatCompactPhone(code, s))
+		// compact: just print digits-only (user can add separators if desired)
+		fmt.Println(code)
 	}
 }
 
@@ -925,8 +960,6 @@ func runDecode(args []string) {
 
 	repair := fs.Int("repair", 0, "If checksum fails, brute-force repair with 1..E edits (within bad blocks)")
 	maxCand := fs.Int("max-candidates", 3, "Max repair candidates to output")
-
-	blockData, blockChk, finalOn, finalOff := commonFlags(fs)
 
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -947,32 +980,27 @@ func runDecode(args []string) {
 		os.Exit(2)
 	}
 
-	s := buildSettings(*blockData, *blockChk, *finalOn, *finalOff)
-	if err := s.validate(); err != nil {
-		fmt.Fprintln(os.Stderr, "settings error:", err)
-		os.Exit(2)
-	}
-
 	normalized := stripNonDigits(in)
-	text, rep, err := decodeCodeWithReport(normalized, s, !*noCheck)
+
+	text, rep, err := decodeCodeWithReport(normalized, !*noCheck)
 	if err == nil {
 		if *prettyFlag {
 			fmt.Println("\x1b[1mDECODED\x1b[0m", text)
 			fmt.Println()
-			prettyPrint(os.Stdout, normalized, s, nil)
+			prettyPrint(os.Stdout, normalized, nil)
 		} else {
 			fmt.Println(text)
 		}
 		return
 	}
 
-	// If verify disabled, err might be utf8/bytes/etc; just print it
+	// If verify disabled, just report
 	if *noCheck {
 		fmt.Fprintln(os.Stderr, "decode error:", err)
 		os.Exit(1)
 	}
 
-	// Show a helpful report
+	// Report details
 	fmt.Fprintln(os.Stderr, "decode error:", err)
 	if len(rep.BadBlocks) > 0 {
 		fmt.Fprintf(os.Stderr, "bad blocks (%d):\n", len(rep.BadBlocks))
@@ -980,13 +1008,13 @@ func runDecode(args []string) {
 			fmt.Fprintf(os.Stderr, " - block %d: expected %s got %s\n", b.BlockIndex, b.Expected, b.Got)
 		}
 	}
-	if s.FinalCheck && !rep.FinalOK {
+	if rep.Header.finalEnabled() && !rep.FinalOK {
 		fmt.Fprintf(os.Stderr, "final checksum mismatch: expected %s got %s\n", rep.FinalExpected, rep.FinalGot)
 	}
 
-	// repair
+	// Repair
 	if *repair > 0 {
-		results, rerr := tryRepair(normalized, s, *repair, *maxCand)
+		results, rerr := tryRepair(normalized, *repair, *maxCand)
 		if rerr != nil {
 			fmt.Fprintln(os.Stderr, "repair error:", rerr)
 			os.Exit(1)
@@ -1000,11 +1028,10 @@ func runDecode(args []string) {
 			for i, r := range results {
 				fmt.Fprintf(os.Stderr, "[%d] edits=%d\n", i+1, len(r.Edits))
 				printEdits(os.Stderr, r.Edits)
-				hl := editsToHighlight(r.Edits)
 				if *prettyFlag {
-					prettyPrint(os.Stderr, r.FixedDigits, s, hl)
+					prettyPrint(os.Stderr, r.FixedDigits, editsToHighlight(r.Edits))
 				} else {
-					fmt.Fprintln(os.Stderr, formatCompactPhone(r.FixedDigits, s))
+					fmt.Fprintln(os.Stderr, r.FixedDigits)
 				}
 				fmt.Fprintln(os.Stderr)
 			}
@@ -1016,8 +1043,7 @@ func runDecode(args []string) {
 			fmt.Println("\x1b[1mREPAIRED\x1b[0m")
 			printEdits(os.Stdout, r.Edits)
 			fmt.Println()
-			hl := editsToHighlight(r.Edits)
-			prettyPrint(os.Stdout, r.FixedDigits, s, hl)
+			prettyPrint(os.Stdout, r.FixedDigits, editsToHighlight(r.Edits))
 			fmt.Println("\n\x1b[1mDECODED\x1b[0m", r.Text)
 		} else {
 			fmt.Println(r.Text)
@@ -1028,72 +1054,3 @@ func runDecode(args []string) {
 	os.Exit(1)
 }
 
-// Simple phone format: show each block as "dd dd ... | cc cc" separated by " - "
-// (header printed first as 4 groups)
-func formatCompactPhone(digitsOnly string, s Settings) string {
-	d := stripNonDigits(digitsOnly)
-	if len(d) < headerDigits {
-		return d
-	}
-	header := d[:headerDigits]
-	body := d[headerDigits:]
-
-	// strip final
-	if s.FinalCheck {
-		fd := 2 * s.FinalCheckGroups
-		if len(body) >= fd {
-			body = body[:len(body)-fd]
-		}
-	}
-
-	hg := splitIntoGroups(header, 2)
-	parts := []string{strings.Join(hg, " ")}
-
-	// parse blocks using header G
-	Gu, _ := parseUintFixedDigits(header[4:8])
-	totalGroups := int(Gu)
-	totalBlocks := (totalGroups + s.BlockDataGroups - 1) / s.BlockDataGroups
-
-	cursor := 0
-	for blk := 1; blk <= totalBlocks; blk++ {
-		remaining := totalGroups - (blk-1)*s.BlockDataGroups
-		thisData := s.BlockDataGroups
-		if remaining < thisData {
-			thisData = remaining
-		}
-		dataDigits := thisData * 2
-		chkDigits := s.BlockCheckGroups * 2
-
-		seg := body[cursor : cursor+dataDigits+chkDigits]
-		cursor += dataDigits + chkDigits
-
-		data := splitIntoGroups(seg[:dataDigits], 2)
-		chk := splitIntoGroups(seg[dataDigits:], 2)
-
-		parts = append(parts, strings.Join(data, " ")+" | "+strings.Join(chk, " "))
-	}
-
-	return strings.Join(parts, " - ")
-}
-
-func printEdits(out io.Writer, edits []Edit) {
-	fmt.Fprintln(out, "\x1b[1mEDITS\x1b[0m")
-	for _, e := range edits {
-		if e.Block == 0 {
-			fmt.Fprintf(out, " - FINAL pos=%d  %02d -> %02d\n", e.Pos, e.From, e.To)
-			continue
-		}
-		fmt.Fprintf(out, " - block=%d pos=%d  %02d -> %02d\n", e.Block, e.Pos, e.From, e.To)
-	}
-}
-
-func editsToHighlight(edits []Edit) map[int]map[int]bool {
-	hl := map[int]map[int]bool{}
-	for _, e := range edits {
-		if hl[e.Block] == nil {
-			hl[e.Block] = map[int]bool{}
-		}
-		hl[e.Block][e.Pos] = true
-	}
-	return hl
-}
